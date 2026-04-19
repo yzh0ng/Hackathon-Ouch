@@ -1476,11 +1476,197 @@ function DetailView({ entry, onClose, onDelete }) {
 // ============================================================================
 
 function ReportTab({ entries, reportTab, setReportTab, showToast }) {
+  const [apiKey, setApiKey] = useState(() => {
+    try { return localStorage.getItem("clearpain_gemini_key") || ""; }
+    catch { return ""; }
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [keyInput, setKeyInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [aiSummary, setAiSummary] = useState(null);
+  const [aiQuestions, setAiQuestions] = useState(null);
+  const [error, setError] = useState(null);
+
+  const saveKey = () => {
+    const trimmed = keyInput.trim();
+    try {
+      if (trimmed) {
+        localStorage.setItem("clearpain_gemini_key", trimmed);
+        setApiKey(trimmed);
+      } else {
+        localStorage.removeItem("clearpain_gemini_key");
+        setApiKey("");
+      }
+    } catch {}
+    setSettingsOpen(false);
+    showToast("saved ✓");
+  };
+
+  const buildPrompt = (s, es) => {
+    const regionFreq = {};
+    Object.entries(s.regionCount).forEach(([r, c]) => {
+      regionFreq[REGION_LABELS[r] || r] = c;
+    });
+    const recent5 = [...es]
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 5)
+      .map((e) => ({
+        date: formatDateLong(e.timestamp),
+        region: REGION_LABELS[e.region] || e.region,
+        painType: e.painType,
+        intensity: e.intensity,
+        trigger: e.trigger,
+      }));
+
+    return `You are a clinical data summarizer and patient advocacy assistant for a pain tracking app. Given the following patient-logged pain data, produce two outputs in a single JSON response.
+
+DATA:
+- Tracking period: ${formatDateLong(s.start)} to ${formatDateLong(s.end)} (${s.spanDays} days, ${s.total} entries)
+- Primary pain location: ${REGION_LABELS[s.topRegion[0]] || s.topRegion[0]} (${s.topRegion[1]} entries)
+- All affected regions: ${s.regions.map((r) => REGION_LABELS[r] || r).join(", ")}
+- Most common pain type: ${s.topType[0]} (${s.topType[1]} occurrences)
+- Most common trigger: ${s.topTrigger[0]} (${s.topTrigger[1]} occurrences)
+- Average intensity: ${s.avgIntensity.toFixed(1)}/10
+- Peak intensity: ${s.maxIntensity}/10 on ${formatDateLong(s.maxEntry.timestamp)} in ${REGION_LABELS[s.maxEntry.region] || s.maxEntry.region}
+- Intensity trend: ${s.trend} over tracking period
+- Region frequency distribution: ${JSON.stringify(regionFreq)}
+- Recent 5 entries (most recent first): ${JSON.stringify(recent5)}
+
+OUTPUT 1 — "summary" (for the doctor):
+- 3-5 sentences a doctor can read in under 15 seconds during a visit.
+- Lead with the most diagnostically significant pattern.
+- Flag any migration patterns (pain moving between regions over time).
+- Note if intensity is trending up despite triggers staying constant.
+- If morning triggers dominate, mention possible positional/inflammatory correlation.
+- Clinical but accessible language. Do NOT diagnose or recommend treatment.
+- Plain text, no markdown, no bullet points.
+
+OUTPUT 2 — "questions" (for the patient to ask their doctor):
+- 5-7 specific questions written in first person as the patient speaking.
+- Every question MUST reference specific data from the log. No generic questions — tie each to actual numbers, regions, triggers, or patterns.
+- Prioritize questions that:
+  1. Surface diagnostic signals (migration, trigger correlations, trends)
+  2. Challenge assumptions ("my pain averages X/10 but I was told this should be improving — what does that tell you?")
+  3. Open doors to next steps (imaging, referrals, med adjustments)
+  4. Address quality of life when intensity is high or trending up
+- If pain spans multiple regions, include at least one question about shared root cause.
+- If one trigger accounts for >40% of entries, include a question about modifying or investigating that trigger.
+- If intensity trends up, include a question about reassessing treatment.
+- Tone: confident, informed, not confrontational.
+
+RESPONSE FORMAT — return ONLY this JSON, no markdown, no backticks:
+{
+  "summary": "...",
+  "questions": ["...", "...", "..."]
+}`;
+  };
+
+  const generate = async () => {
+    if (!apiKey) {
+      showToast("add your Gemini API key in settings first");
+      return;
+    }
+    const stats = computeStats(entries);
+    if (!stats) {
+      showToast("no data to analyze yet");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: buildPrompt(stats, entries) }] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 1000 },
+          }),
+        }
+      );
+
+      if (res.status === 429) {
+        setError("too many requests — try again in a minute");
+        setLoading(false);
+        return;
+      }
+      if (!res.ok) {
+        setError("couldn't generate — check your API key");
+        setLoading(false);
+        return;
+      }
+
+      const data = await res.json();
+      let text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      text = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        setError("couldn't generate — check your API key");
+        setLoading(false);
+        return;
+      }
+
+      if (typeof parsed.summary !== "string" || !Array.isArray(parsed.questions)) {
+        setError("couldn't generate — check your API key");
+        setLoading(false);
+        return;
+      }
+
+      const cleanSummary = parsed.summary.trim();
+      const cleanQuestions = parsed.questions.filter((q) => typeof q === "string" && q.trim().length > 0);
+
+      setAiSummary(cleanSummary || null);
+      setAiQuestions(cleanQuestions.length > 0 ? cleanQuestions : null);
+    } catch {
+      setError("couldn't generate — check your API key");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="cp-report">
       <div className="cp-report-header">
         <h2>report</h2>
+        <button
+          className="cp-settings-gear"
+          onClick={() => { setKeyInput(apiKey); setSettingsOpen(true); }}
+          aria-label="settings"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
+          {apiKey && <span className="cp-settings-gear-dot" />}
+        </button>
       </div>
+
+      <button
+        className="cp-ai-generate-btn"
+        onClick={generate}
+        disabled={loading}
+      >
+        {loading ? (
+          <>
+            <span className="cp-ai-shimmer-dot" />
+            generating insights...
+          </>
+        ) : (
+          <>
+            <span className="cp-ai-sparkle">✦</span>
+            generate AI insights
+          </>
+        )}
+      </button>
+
+      {error && <div className="cp-ai-error">{error}</div>}
+
       <div className="cp-report-tabs">
         <button
           className={`cp-rtab ${reportTab === "summary" ? "active" : ""}`}
@@ -1497,9 +1683,44 @@ function ReportTab({ entries, reportTab, setReportTab, showToast }) {
       </div>
 
       {reportTab === "summary" ? (
-        <SummarySection entries={entries} />
+        <SummarySection
+          entries={entries}
+          aiSummary={aiSummary}
+          loading={loading}
+          showToast={showToast}
+        />
       ) : (
-        <QuestionsSection entries={entries} showToast={showToast} />
+        <QuestionsSection
+          entries={entries}
+          aiQuestions={aiQuestions}
+          loading={loading}
+          onReset={() => setAiQuestions(null)}
+          showToast={showToast}
+        />
+      )}
+
+      {settingsOpen && (
+        <div className="cp-settings-overlay" onClick={() => setSettingsOpen(false)}>
+          <div className="cp-settings-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="cp-settings-title">settings</div>
+            <label className="cp-settings-label">Gemini API Key</label>
+            <input
+              className="cp-settings-input"
+              type="password"
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+              placeholder="paste your key"
+              autoFocus
+            />
+            <div className="cp-settings-hint">
+              stored locally on this device only. used only to call Google's API.
+            </div>
+            <div className="cp-settings-actions">
+              <button className="cp-settings-cancel" onClick={() => setSettingsOpen(false)}>cancel</button>
+              <button className="cp-settings-save" onClick={saveKey}>save</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -1570,11 +1791,21 @@ function computeStats(entries) {
   };
 }
 
-function SummarySection({ entries }) {
+function SummarySection({ entries, aiSummary, loading, showToast }) {
   const s = useMemo(() => computeStats(entries), [entries]);
 
   const handlePrint = () => {
     window.print();
+  };
+
+  const copySummary = async () => {
+    if (!aiSummary) return;
+    try {
+      await navigator.clipboard.writeText(aiSummary);
+      showToast("copied ✓");
+    } catch {
+      showToast("copy failed");
+    }
   };
 
   if (!s) {
@@ -1600,6 +1831,23 @@ function SummarySection({ entries }) {
 
   return (
     <div className="cp-summary" id="cp-print-area">
+      {loading && !aiSummary && (
+        <div className="cp-ai-summary-card">
+          <div className="cp-summary-meta">AI-generated</div>
+          <div className="cp-shimmer-line" />
+          <div className="cp-shimmer-line" />
+          <div className="cp-shimmer-line cp-shimmer-short" />
+        </div>
+      )}
+
+      {aiSummary && (
+        <div className="cp-ai-summary-card">
+          <div className="cp-summary-meta">AI-generated</div>
+          <div className="cp-ai-summary-text">{aiSummary}</div>
+          <button className="cp-ai-copy-btn" onClick={copySummary}>copy summary</button>
+        </div>
+      )}
+
       <div className="cp-summary-card">
         <div className="cp-summary-title">Pain Log Summary</div>
         <div className="cp-summary-meta">
@@ -1631,46 +1879,40 @@ function SummarySection({ entries }) {
   );
 }
 
-function QuestionsSection({ entries, showToast }) {
+function QuestionsSection({ entries, aiQuestions, loading, onReset, showToast }) {
   const s = useMemo(() => computeStats(entries), [entries]);
 
   if (!s) {
     return <div className="cp-summary-empty">log a few entries to see suggested questions.</div>;
   }
 
-  const questions = [];
-  questions.push(`What could be causing pain in my ${REGION_LABELS[s.topRegion[0]]}?`);
-  questions.push(`Is there anything I should avoid doing when the pain is at its worst?`);
-
+  const defaults = [];
+  defaults.push(`What could be causing pain in my ${REGION_LABELS[s.topRegion[0]]}?`);
+  defaults.push(`Is there anything I should avoid doing when the pain is at its worst?`);
   if (s.avgIntensity > 6) {
-    questions.push(`My pain has been averaging ${s.avgIntensity.toFixed(1)}/10 — is that level something we should treat more aggressively?`);
+    defaults.push(`My pain has been averaging ${s.avgIntensity.toFixed(1)}/10 — is that level something we should treat more aggressively?`);
   }
   if (s.trend === "up") {
-    questions.push(`My pain seems to be getting more intense over time — what does that suggest?`);
+    defaults.push(`My pain seems to be getting more intense over time — what does that suggest?`);
   }
   if (s.regions.length >= 2) {
     const [a, b] = s.regions;
-    questions.push(`I've been noticing pain in multiple areas — ${REGION_LABELS[a]} and ${REGION_LABELS[b]} — could these be connected?`);
+    defaults.push(`I've been noticing pain in multiple areas — ${REGION_LABELS[a]} and ${REGION_LABELS[b]} — could these be connected?`);
   }
   if (s.topTrigger[0] === "waking up") {
-    questions.push(`My pain is often worst when I wake up — could that be related to how I'm sleeping or something inflammatory?`);
+    defaults.push(`My pain is often worst when I wake up — could that be related to how I'm sleeping or something inflammatory?`);
   }
-  if (s.topTrigger[0] === "stress" || Object.keys(s.regionCount).some((r) => r === "stress")) {
-    // check if stress appears in trigger list
-  }
-  // separate stress check via trigger data
   const stressCount = entries.filter((e) => e.trigger === "stress").length;
-  if (stressCount >= 2 && !questions.some((q) => q.includes("stress"))) {
-    questions.push(`I've noticed pain correlates with stress — are there approaches that address both?`);
+  if (stressCount >= 2 && !defaults.some((q) => q.includes("stress"))) {
+    defaults.push(`I've noticed pain correlates with stress — are there approaches that address both?`);
   }
+  defaults.push(`Based on this log, what would you recommend as a next step?`);
 
-  questions.push(`Based on this log, what would you recommend as a next step?`);
-
-  // Cap at 7
-  const final = questions.slice(0, 7);
+  const usingAi = aiQuestions && aiQuestions.length > 0;
+  const active = usingAi ? aiQuestions : defaults.slice(0, 7);
 
   const copyAll = async () => {
-    const text = final.map((q, i) => `${i + 1}. ${q}`).join("\n");
+    const text = active.map((q, i) => `${i + 1}. ${q}`).join("\n");
     try {
       await navigator.clipboard.writeText(text);
       showToast("copied ✓");
@@ -1682,21 +1924,43 @@ function QuestionsSection({ entries, showToast }) {
   return (
     <div className="cp-questions">
       <div className="cp-questions-header">
-        <h3>questions to ask your doctor</h3>
+        <h3>
+          questions to ask your doctor
+          {usingAi && <span className="cp-ai-badge">AI-personalized</span>}
+        </h3>
         <p>based on what you've logged, here are things worth bringing up.</p>
+        {usingAi && (
+          <button className="cp-ai-reset-link" onClick={onReset}>
+            reset to default
+          </button>
+        )}
       </div>
-      <div className="cp-questions-list">
-        {final.map((q, i) => (
-          <div key={i} className="cp-question-card">
-            <div className="cp-quote-icon">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
-                <path d="M7 7h3v3c0 2-1 3-3 4M14 7h3v3c0 2-1 3-3 4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
+
+      {loading && !usingAi ? (
+        <div className="cp-questions-list">
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="cp-question-card">
+              <div style={{ flex: 1 }}>
+                <div className="cp-shimmer-line" />
+                <div className="cp-shimmer-line cp-shimmer-short" />
+              </div>
             </div>
-            <div className="cp-question-text">{q}</div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      ) : (
+        <div className="cp-questions-list">
+          {active.map((q, i) => (
+            <div key={i} className="cp-question-card">
+              <div className="cp-quote-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+                  <path d="M7 7h3v3c0 2-1 3-3 4M14 7h3v3c0 2-1 3-3 4" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </div>
+              <div className="cp-question-text">{q}</div>
+            </div>
+          ))}
+        </div>
+      )}
       <button className="cp-copy-btn" onClick={copyAll}>copy all questions</button>
     </div>
   );
@@ -2543,5 +2807,267 @@ const styles = `
     padding: 0;
   }
   .cp-print-btn { display: none !important; }
+}
+
+/* ============ AI / SETTINGS ============ */
+.cp-report-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+}
+.cp-report-header h2 {
+  margin: 0;
+}
+
+.cp-settings-gear {
+  position: relative;
+  background: transparent;
+  border: none;
+  color: #8A8A8A;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 150ms ease, background 150ms ease;
+}
+.cp-settings-gear:hover {
+  color: #2C2C2C;
+  background: #F5F2ED;
+}
+.cp-settings-gear-dot {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7BAE8F;
+  box-shadow: 0 0 0 2px #FFFFFF;
+}
+
+.cp-settings-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(44,44,44,0.3);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  animation: fade-in 200ms ease;
+}
+.cp-settings-modal {
+  background: #FFFFFF;
+  border-radius: 22px;
+  padding: 24px 22px;
+  width: 100%;
+  max-width: 320px;
+  box-shadow: 0 20px 50px rgba(0,0,0,0.15);
+  animation: detail-in 240ms ease;
+}
+.cp-settings-title {
+  font-family: 'Playfair Display', serif;
+  font-size: 20px;
+  margin-bottom: 16px;
+  color: #2C2C2C;
+}
+.cp-settings-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #8A8A8A;
+  display: block;
+  margin-bottom: 6px;
+}
+.cp-settings-input {
+  width: 100%;
+  padding: 11px 14px;
+  border: 1px solid #EEEAE2;
+  border-radius: 12px;
+  font-family: inherit;
+  font-size: 13px;
+  color: #2C2C2C;
+  background: #FAFAF8;
+  outline: none;
+  transition: border-color 150ms ease;
+}
+.cp-settings-input:focus {
+  border-color: #7BAE8F;
+}
+.cp-settings-hint {
+  font-size: 11px;
+  color: #B5B5B5;
+  margin-top: 8px;
+  line-height: 1.5;
+}
+.cp-settings-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 20px;
+}
+.cp-settings-cancel, .cp-settings-save {
+  flex: 1;
+  padding: 11px;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+.cp-settings-cancel {
+  background: transparent;
+  border: 1px solid #EEEAE2;
+  color: #6B6B6B;
+}
+.cp-settings-cancel:hover {
+  border-color: #B5B5B5;
+  color: #2C2C2C;
+}
+.cp-settings-save {
+  background: #7BAE8F;
+  border: 1px solid #7BAE8F;
+  color: #FFFFFF;
+}
+.cp-settings-save:hover {
+  background: #6a9c7d;
+}
+
+.cp-ai-generate-btn {
+  width: 100%;
+  margin-bottom: 14px;
+  background: #FFFFFF;
+  border: 1px solid #EEEAE2;
+  border-radius: 999px;
+  padding: 12px;
+  font-family: inherit;
+  font-size: 13px;
+  color: #6B6B6B;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 180ms ease;
+}
+.cp-ai-generate-btn:hover:not(:disabled) {
+  border-color: #7BAE8F;
+  color: #7BAE8F;
+}
+.cp-ai-generate-btn:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+.cp-ai-sparkle {
+  color: #7BAE8F;
+  font-size: 13px;
+}
+.cp-ai-shimmer-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #7BAE8F;
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+.cp-ai-error {
+  color: #E8735A;
+  font-size: 12px;
+  text-align: center;
+  margin-bottom: 14px;
+  padding: 9px 12px;
+  background: rgba(232,115,90,0.06);
+  border-radius: 12px;
+}
+
+.cp-ai-summary-card {
+  background: #FAFAF8;
+  border-radius: 18px;
+  padding: 18px 18px 16px;
+  box-shadow: 0 1px 8px rgba(0,0,0,0.05);
+  border-left: 3px solid #7BAE8F;
+  margin-bottom: 14px;
+}
+.cp-ai-summary-text {
+  font-size: 13px;
+  line-height: 1.6;
+  color: #3C3C3C;
+  margin-top: 10px;
+  margin-bottom: 14px;
+}
+.cp-ai-copy-btn {
+  background: transparent;
+  border: 1px solid #EEEAE2;
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-family: inherit;
+  font-size: 12px;
+  color: #6B6B6B;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+.cp-ai-copy-btn:hover {
+  border-color: #7BAE8F;
+  color: #7BAE8F;
+}
+
+.cp-ai-badge {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #7BAE8F;
+  background: rgba(123,174,143,0.12);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 400;
+  vertical-align: middle;
+}
+
+.cp-ai-reset-link {
+  background: none;
+  border: none;
+  color: #8A8A8A;
+  font-family: inherit;
+  font-size: 11px;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+  margin-top: 2px;
+}
+.cp-ai-reset-link:hover {
+  color: #2C2C2C;
+}
+
+.cp-shimmer-line {
+  height: 10px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, #F0EDE8 0%, #E8E4DC 50%, #F0EDE8 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  margin: 10px 0;
+}
+.cp-shimmer-short { width: 60%; }
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@media print {
+  .cp-ai-copy-btn, .cp-ai-generate-btn, .cp-settings-gear, .cp-ai-error, .cp-ai-reset-link, .cp-ai-badge { display: none !important; }
+  .cp-ai-summary-card {
+    background: transparent;
+    box-shadow: none;
+    border-left: 2px solid #7BAE8F;
+    padding: 0 0 0 12px;
+    margin-bottom: 16px;
+  }
 }
 `;
